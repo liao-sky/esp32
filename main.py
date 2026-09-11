@@ -1,7 +1,6 @@
 """
-离线双人情感互动信物 - 多线程完整版（局部刷新）
+离线双人情感互动信物 - 多线程完整版（最终修复版）
 硬件: ESP32-S3 + E22-400M22S (LoRa) + OLED + 按键 + 马达 + LED
-功能: 时间显示、长按设时、单击发送情感信号、双击时间同步
 """
 
 import _thread
@@ -21,7 +20,7 @@ LORA_AUX = 15
 
 BUTTON_PIN = 4
 MOTOR_PIN = 5
-LED_PIN = 7
+LED_PIN = 7      # 仿真器无GPIO6，用7代替
 OLED_SDA = 18
 OLED_SCL = 20
 
@@ -44,18 +43,27 @@ m1.value(0)
 
 uart_lock = _thread.allocate_lock()
 
-def wait_aux_high():
+def wait_aux_high(timeout_ms=100):
+    """等待AUX变高，超时返回False（防死锁）"""
+    start = time.ticks_ms()
     while aux.value() == 0:
+        if time.ticks_diff(time.ticks_ms(), start) > timeout_ms:
+            return False
         time.sleep_ms(5)
+    return True
 
 def lora_send(packet):
+    """线程安全发送，返回写入UART的时刻（用于RTT精确计算）"""
     uart_lock.acquire()
     try:
-        wait_aux_high()
+        if not wait_aux_high(100):
+            print("[警告] AUX超时，强制发送")
         uart.write((packet + "\n").encode('utf-8'))
+        send_time = time.ticks_ms()
     finally:
         uart_lock.release()
     print("[TX]", packet)
+    return send_time
 
 # ===== 事件队列 =====
 class EventQueue:
@@ -74,7 +82,7 @@ class EventQueue:
 
 event_queue = EventQueue()
 
-# ===== 软时钟（毫秒精度 + 原子读写）=====
+# ===== 软时钟 =====
 class SoftClock:
     def __init__(self, h=12, m=0, s=0):
         self._base = ((h * 3600 + m * 60 + s) * 1000, time.ticks_ms())
@@ -124,9 +132,9 @@ class SoftClock:
 
 clock = SoftClock(12, 0, 0)
 
-# ===== 多击检测器 =====
+# ===== 多击检测器（去抖30ms）=====
 class MultiClickDetector:
-    def __init__(self, pin, click_timeout=400, long_press_time=800, debounce_ms=20):
+    def __init__(self, pin, click_timeout=400, long_press_time=800, debounce_ms=30):
         self.pin = pin
         self.click_timeout = click_timeout
         self.long_press_time = long_press_time
@@ -204,19 +212,55 @@ sync_state = {
     'delay_ms': 0, 'start': 0, 'done_until': 0,
 }
 
-# ===== 显示布局（分层刷新）=====
+# ===== 非阻塞输出控制 =====
+led_off_at = 0
+motor_off_at = 0
+
+def flash_led(ms=200):
+    global led_off_at
+    led.value(1)
+    led_off_at = time.ticks_ms() + ms
+
+def vibrate(ms=500):
+    global motor_off_at, led_off_at
+    motor.value(1)
+    led.value(1)
+    now = time.ticks_ms()
+    motor_off_at = now + ms
+    led_off_at = now + ms
+
+def update_outputs():
+    global led_off_at, motor_off_at
+    now = time.ticks_ms()
+    if led_off_at and time.ticks_diff(now, led_off_at) >= 0:
+        led.value(0)
+        led_off_at = 0
+    if motor_off_at and time.ticks_diff(now, motor_off_at) >= 0:
+        motor.value(0)
+        motor_off_at = 0
+
+# ===== 显示（分层 + 统一flush）=====
 TITLE_Y = 0
 ID_Y = 14
 STATUS_Y1 = 28
 STATUS_Y2 = 40
 TIME_Y = 52
-TIME_X = 32   # 8字符 * 8px = 64px，居中(128-64)/2=32
+TIME_X = 32
 
-# 显示缓存：记录当前屏幕已显示的内容，避免重复刷新
 _disp = {'time': '', 's1': '', 's2': ''}
+_display_dirty = False
+
+def mark_dirty():
+    global _display_dirty
+    _display_dirty = True
+
+def flush_display():
+    global _display_dirty
+    if _display_dirty:
+        oled.show()
+        _display_dirty = False
 
 def init_display():
-    """初始化：一次性画好静态层 + 时间行"""
     oled.fill(0)
     oled.text("LoRa Love Tag", 0, TITLE_Y)
     oled.text("ID:{} M:{}".format(PAIR_ID, DEVICE_NAME), 0, ID_Y)
@@ -228,7 +272,6 @@ def init_display():
     _disp['s2'] = ''
 
 def update_status(s1=None, s2=None):
-    """只更新状态区两行，内容变化才刷新"""
     changed = False
     if s1 is not None and s1 != _disp['s1']:
         _disp['s1'] = s1
@@ -243,32 +286,19 @@ def update_status(s1=None, s2=None):
         oled.text(_disp['s1'], 0, STATUS_Y1)
     if _disp['s2']:
         oled.text(_disp['s2'], 0, STATUS_Y2)
-    oled.show()
+    mark_dirty()
 
 def update_time():
-    """只更新时间行：固定8字符直接覆盖，不清屏，无闪烁"""
     t = clock.format()
     if t == _disp['time']:
         return
     _disp['time'] = t
     oled.text(t, TIME_X, TIME_Y)
-    oled.show()
-
-# ===== 辅助 =====
-def flash_led(ms=200):
-    led.value(1)
-    time.sleep_ms(ms)
-    led.value(0)
-
-def vibrate(ms=500):
-    motor.value(1)
-    led.value(1)
-    time.sleep_ms(ms)
-    motor.value(0)
-    led.value(0)
+    mark_dirty()
 
 # ===== LoRa 线程 =====
 rx_buffer = b""
+MAX_RX_BUFFER = 512
 
 def process_message(msg):
     if ',' not in msg:
@@ -306,6 +336,10 @@ def lora_thread():
                 uart_lock.release()
             if chunk:
                 rx_buffer += chunk
+                if len(rx_buffer) > MAX_RX_BUFFER:
+                    print("[警告] RX缓冲区溢出，清空")
+                    rx_buffer = b""
+                    continue
                 while b"\n" in rx_buffer:
                     line, rx_buffer = rx_buffer.split(b"\n", 1)
                     try:
@@ -318,13 +352,10 @@ def lora_thread():
         time.sleep_ms(10)
 
 # ===== 主线程事件处理 =====
-temp_msg = {'s1': '', 's2': '', 'until': 0}
+temp_msg = {'until': 0}
 
 def show_temp(s1, s2, ms=500):
-    """临时状态提示，超时后自动恢复常态"""
     update_status(s1, s2)
-    temp_msg['s1'] = s1
-    temp_msg['s2'] = s2
     temp_msg['until'] = time.ticks_ms() + ms
 
 def start_sync():
@@ -332,11 +363,10 @@ def start_sync():
     state = STATE_SYNCING
     sync_state['active'] = True
     sync_state['phase'] = 0
-    now = time.ticks_ms()
-    sync_state['start'] = now
-    sync_state['t0'] = now
-    lora_send("{},PING".format(PAIR_ID))
+    sync_state['start'] = time.ticks_ms()
     update_status("Time Sync", "Pinging...")
+    # 发送后再取t0，避免AUX等待污染RTT
+    sync_state['t0'] = lora_send("{},PING".format(PAIR_ID))
 
 def on_pong(t1_from_thread):
     if not sync_state['active'] or sync_state['phase'] != 0:
@@ -362,19 +392,19 @@ def on_time_resp(data):
     except Exception as e:
         print("[同步] 解析失败:", e)
         sync_state['active'] = False
+        sync_state['phase'] = 0
         state = STATE_NORMAL
 
 def handle_lora_event(evt):
     typ, data = evt
     if typ == 'TOUCH':
         print("[事件] 收到情感信号")
-        vibrate(500)
-        # 临时提示（仅当不在同步/设定时）
+        vibrate(500)   # 非阻塞
         if state == STATE_NORMAL:
             show_temp("Received!", "From partner", 600)
     elif typ == 'TOUCH_ACK':
         print("[事件] 对方已确认")
-        flash_led(150)
+        flash_led(150)  # 非阻塞
     elif typ == 'PONG':
         on_pong(data)
     elif typ == 'TIME_RESP':
@@ -388,8 +418,8 @@ def handle_button_event(event):
     if state == STATE_NORMAL:
         if event == 'click':
             print("[按键] 单击发送")
+            flash_led(200)  # 非阻塞
             lora_send("{},TOUCH".format(PAIR_ID))
-            flash_led(200)
             show_temp("Sent!", "TOUCH", 400)
         elif event == 'double':
             print("[按键] 双击同步时间")
@@ -446,7 +476,10 @@ while True:
             break
         handle_lora_event(lora_evt)
 
-    # 3. 同步流程管理
+    # 3. 非阻塞输出更新（LED/马达到期自动关闭）
+    update_outputs()
+
+    # 4. 同步流程管理
     if sync_state['active']:
         if sync_state['phase'] == 2:
             if time.ticks_diff(time.ticks_ms(), sync_state['done_until']) >= 0:
@@ -456,19 +489,18 @@ while True:
             if time.ticks_diff(time.ticks_ms(), sync_state['start']) > 5000:
                 print("[同步] 超时")
                 sync_state['active'] = False
+                sync_state['phase'] = 0
                 state = STATE_NORMAL
 
-    # 4. 根据状态刷新状态区（仅内容变化时触发 show）
-    now = time.ticks_ms()
+    # 5. 状态区刷新（仅内容变化时触发）
     if state == STATE_NORMAL:
-        if time.ticks_diff(now, temp_msg['until']) >= 0:
-            update_status("Ready", "1:Send 2:Sync L:Set")
-    elif state == STATE_SYNCING:
-        pass  # 同步过程由on_pong/on_time_resp控制显示
-    elif state in (STATE_SET_HOUR, STATE_SET_MIN, STATE_SET_SEC):
-        pass  # 设定模式由按键事件控制显示
+        if time.ticks_diff(time.ticks_ms(), temp_msg['until']) >= 0:
+            update_status("Ready", "1:Snd 2:Syn L:Set")
 
-    # 5. 时间行始终每秒刷新（固定宽度覆盖，无闪烁）
+    # 6. 时间行始终刷新（每秒变化时）
     update_time()
+
+    # 7. 统一 flush（每轮最多一次 show）
+    flush_display()
 
     time.sleep_ms(20)
