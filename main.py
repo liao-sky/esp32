@@ -218,16 +218,20 @@ motor_off_at = 0
 
 def flash_led(ms=200):
     global led_off_at
+    now = time.ticks_ms()
     led.value(1)
-    led_off_at = time.ticks_ms() + ms
+    # 只在现有计划更早时才更新，避免覆盖更晚的关闭时间
+    if time.ticks_diff(now + ms, led_off_at) > 0:
+        led_off_at = now + ms
 
 def vibrate(ms=500):
     global motor_off_at, led_off_at
+    now = time.ticks_ms()
     motor.value(1)
     led.value(1)
-    now = time.ticks_ms()
     motor_off_at = now + ms
-    led_off_at = now + ms
+    if time.ticks_diff(now + ms, led_off_at) > 0:
+        led_off_at = now + ms
 
 def update_outputs():
     global led_off_at, motor_off_at
